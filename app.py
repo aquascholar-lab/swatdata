@@ -28,6 +28,7 @@ import requests
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+gpd.options.io_engine = "pyogrio"
 import rasterio
 import streamlit as st
 
