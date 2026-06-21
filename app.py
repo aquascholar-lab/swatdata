@@ -1,34 +1,19 @@
 # ============================================================
 # STREAMLIT APP
-# NASA POWER DAILY WEATHER DATA DOWNLOADER FOR SWAT INPUT
-# ============================================================
-# Features:
-# - Upload subbasin shapefile ZIP
-# - Upload DEM GeoTIFF
-# - Select date range
-# - Select weather parameters
-# - Generate one INDEX.txt for each selected weather parameter
-# - Generate one text file per subbasin/station
-# - Visualize subbasin centroid stations
-# - Visualize downloaded daily weather time series
-# - Download final output as ZIP
-# ============================================================
-
-
-# ============================================================
-# 1. IMPORT LIBRARIES
+# NASA POWER DAILY WEATHER DATA DOWNLOADER
+# FOR ArcSWAT / SWAT2012 FORMAT
 # ============================================================
 
 import os
 import re
 import time
+import shutil
 import zipfile
 import tempfile
 import requests
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-gpd.options.io_engine = "pyogrio"
 import rasterio
 import streamlit as st
 
@@ -36,19 +21,29 @@ from datetime import date
 from rasterio.warp import transform
 
 
+# ------------------------------------------------------------
+# Force GeoPandas to use pyogrio instead of Fiona
+# This is better for Streamlit Cloud deployment
+# ------------------------------------------------------------
+try:
+    gpd.options.io_engine = "pyogrio"
+except Exception:
+    pass
+
+
 # ============================================================
-# 2. PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="NASA POWER to SWAT Weather App",
+    page_title="NASA POWER to ArcSWAT Weather App",
     page_icon="🌦️",
     layout="wide"
 )
 
 
 # ============================================================
-# 3. CUSTOM CSS
+# CSS
 # ============================================================
 
 st.markdown(
@@ -65,19 +60,12 @@ st.markdown(
         color: #444444;
         margin-bottom: 20px;
     }
-    .section-box {
+    .info-box {
         background-color: #F7F9FC;
-        padding: 18px;
-        border-radius: 14px;
-        border: 1px solid #E1E5EE;
-        margin-bottom: 15px;
-    }
-    .metric-card {
-        background-color: white;
         padding: 16px;
         border-radius: 12px;
-        border: 1px solid #E6E6E6;
-        box-shadow: 0px 2px 8px rgba(0,0,0,0.05);
+        border: 1px solid #DDE3EA;
+        margin-bottom: 14px;
     }
     </style>
     """,
@@ -86,84 +74,66 @@ st.markdown(
 
 
 # ============================================================
-# 4. APP HEADER
+# HEADER
 # ============================================================
 
-st.markdown('<div class="main-title">🌦️ NASA POWER Weather Data Downloader for SWAT</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Generate SWAT-ready daily weather text files and INDEX files for each subbasin using NASA POWER data.</div>',
+    '<div class="main-title">🌦️ NASA POWER Weather Data Downloader for ArcSWAT</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="sub-title">Generate ArcSWAT-ready daily weather files from NASA POWER using subbasin centroids.</div>',
     unsafe_allow_html=True
 )
 
 
 # ============================================================
-# 5. GLOBAL SETTINGS
+# PARAMETER SETTINGS
 # ============================================================
 
-NASA_PARAMETER_INFO = {
+# ArcSWAT weather types
+# pcp   = precipitation
+# tmp   = maximum and minimum temperature together
+# solar = solar radiation
+# rh    = relative humidity
+# wind  = wind speed
+
+PARAMETER_INFO = {
     "pcp": {
         "label": "Precipitation",
         "folder": "pcp",
+        "index_file": "pcp.txt",
         "nasa": ["PRECTOTCORR"],
-        "columns": ["DATE", "PCP_mm"],
-        "out_columns": ["DATE", "VALUE"],
         "unit": "mm/day"
-    },
-    "tmax": {
-        "label": "Maximum Temperature",
-        "folder": "tmax",
-        "nasa": ["T2M_MAX"],
-        "columns": ["DATE", "TMAX_C"],
-        "out_columns": ["DATE", "VALUE"],
-        "unit": "°C"
-    },
-    "tmin": {
-        "label": "Minimum Temperature",
-        "folder": "tmin",
-        "nasa": ["T2M_MIN"],
-        "columns": ["DATE", "TMIN_C"],
-        "out_columns": ["DATE", "VALUE"],
-        "unit": "°C"
     },
     "tmp": {
         "label": "Temperature Tmax and Tmin",
         "folder": "tmp",
+        "index_file": "tmp.txt",
         "nasa": ["T2M_MAX", "T2M_MIN"],
-        "columns": ["DATE", "TMAX_C", "TMIN_C"],
-        "out_columns": ["DATE", "TMAX_C", "TMIN_C"],
-        "unit": "°C"
+        "unit": "degree Celsius"
     },
-    "tmean": {
-        "label": "Mean Temperature",
-        "folder": "tmean",
-        "nasa": ["T2M"],
-        "columns": ["DATE", "TMEAN_C"],
-        "out_columns": ["DATE", "VALUE"],
-        "unit": "°C"
+    "solar": {
+        "label": "Solar Radiation",
+        "folder": "solar",
+        "index_file": "solar.txt",
+        "nasa": ["ALLSKY_SFC_SW_DWN"],
+        "unit": "MJ/m²/day"
     },
     "rh": {
         "label": "Relative Humidity",
         "folder": "rh",
+        "index_file": "rh.txt",
         "nasa": ["RH2M"],
-        "columns": ["DATE", "RH_percent"],
-        "out_columns": ["DATE", "VALUE"],
         "unit": "%"
     },
     "wind": {
         "label": "Wind Speed",
         "folder": "wind",
+        "index_file": "wind.txt",
         "nasa": ["WS2M"],
-        "columns": ["DATE", "WIND_m_s"],
-        "out_columns": ["DATE", "VALUE"],
         "unit": "m/s"
-    },
-    "solar": {
-        "label": "Solar Radiation",
-        "folder": "solar",
-        "nasa": ["ALLSKY_SFC_SW_DWN"],
-        "columns": ["DATE", "SOLAR_MJ_m2_day"],
-        "out_columns": ["DATE", "VALUE"],
-        "unit": "MJ/m²/day"
     }
 }
 
@@ -171,47 +141,65 @@ MISSING_VALUE = -99.0
 
 
 # ============================================================
-# 6. HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # ============================================================
 
 def safe_filename(name):
-    name = str(name)
+    """Make safe file/station name."""
+    name = str(name).strip()
     name = re.sub(r"[^A-Za-z0-9_\-]+", "_", name)
+    if name == "":
+        name = "station"
     return name
 
 
 def save_uploaded_file(uploaded_file, output_path):
+    """Save uploaded Streamlit file."""
     with open(output_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
 
+def clean_folder(folder_path):
+    """Remove and recreate folder."""
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+    os.makedirs(folder_path, exist_ok=True)
+
+
 def extract_shapefile_zip(zip_path, extract_dir):
+    """Extract shapefile ZIP and return .shp path."""
+    clean_folder(extract_dir)
+
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(extract_dir)
 
     shp_files = []
+
     for root, dirs, files in os.walk(extract_dir):
         for file in files:
             if file.lower().endswith(".shp"):
                 shp_files.append(os.path.join(root, file))
 
     if len(shp_files) == 0:
-        raise FileNotFoundError("No .shp file found in the uploaded ZIP.")
+        raise FileNotFoundError("No .shp file found in uploaded ZIP.")
 
     return shp_files[0]
 
 
 def build_station_table(subbasin_shp, dem_path, name_field=None):
+    """Generate station table from subbasin centroids and DEM elevation."""
+
     sub_gdf = gpd.read_file(subbasin_shp)
 
     if sub_gdf.empty:
         raise ValueError("The uploaded subbasin shapefile is empty.")
 
     if sub_gdf.crs is None:
-        raise ValueError("The subbasin shapefile has no CRS. Please define projection first.")
+        raise ValueError("Subbasin shapefile has no CRS. Please define projection first.")
 
     original_crs = str(sub_gdf.crs)
 
+    # Use projected CRS for accurate centroid calculation
     estimated_utm = sub_gdf.estimate_utm_crs()
 
     if estimated_utm is not None:
@@ -232,17 +220,18 @@ def build_station_table(subbasin_shp, dem_path, name_field=None):
     centroid_gdf["ID"] = np.arange(1, len(centroid_gdf) + 1)
 
     if name_field is not None and name_field != "Auto sub001, sub002...":
-        centroid_gdf["NAME"] = centroid_gdf[name_field].astype(str)
+        centroid_gdf["NAME"] = centroid_gdf[name_field].astype(str).apply(safe_filename)
     else:
-        centroid_gdf["NAME"] = [f"sub{i+1:03d}" for i in range(len(centroid_gdf))]
+        centroid_gdf["NAME"] = [f"sub{i + 1:03d}" for i in range(len(centroid_gdf))]
 
+    # Extract elevation from DEM
     elevations = []
 
     with rasterio.open(dem_path) as dem:
         dem_crs = dem.crs
 
         if dem_crs is None:
-            raise ValueError("The DEM has no CRS. Please define projection first.")
+            raise ValueError("DEM has no CRS. Please define projection first.")
 
         for _, row in centroid_gdf.iterrows():
             lon = float(row["LONG"])
@@ -250,24 +239,29 @@ def build_station_table(subbasin_shp, dem_path, name_field=None):
 
             try:
                 x, y = transform("EPSG:4326", dem_crs, [lon], [lat])
-                val = list(dem.sample([(x[0], y[0])]))[0][0]
+                value = list(dem.sample([(x[0], y[0])]))[0][0]
             except Exception:
-                val = np.nan
+                value = np.nan
 
-            if dem.nodata is not None and val == dem.nodata:
-                val = np.nan
+            if dem.nodata is not None and value == dem.nodata:
+                value = np.nan
 
-            if not np.isfinite(val):
-                val = np.nan
+            if not np.isfinite(value):
+                value = np.nan
 
-            elevations.append(float(val) if np.isfinite(val) else np.nan)
+            elevations.append(value)
 
     centroid_gdf["ELEVATION"] = elevations
 
     mean_elev = centroid_gdf["ELEVATION"].replace([np.inf, -np.inf], np.nan).mean()
+
+    if np.isnan(mean_elev):
+        mean_elev = 0.0
+
     centroid_gdf["ELEVATION"] = centroid_gdf["ELEVATION"].fillna(mean_elev)
 
     station_df = centroid_gdf[["ID", "NAME", "LAT", "LONG", "ELEVATION"]].copy()
+
     station_df["LAT"] = station_df["LAT"].round(6)
     station_df["LONG"] = station_df["LONG"].round(6)
     station_df["ELEVATION"] = station_df["ELEVATION"].round(2)
@@ -276,16 +270,18 @@ def build_station_table(subbasin_shp, dem_path, name_field=None):
 
 
 def get_required_nasa_parameters(selected_parameters):
+    """Get unique NASA POWER parameter list."""
     required = []
 
-    for p in selected_parameters:
-        required.extend(NASA_PARAMETER_INFO[p]["nasa"])
+    for parameter in selected_parameters:
+        required.extend(PARAMETER_INFO[parameter]["nasa"])
 
-    required = sorted(list(set(required)))
-    return required
+    return sorted(list(set(required)))
 
 
 def download_nasa_power_daily(lat, lon, start_date, end_date, nasa_parameters, max_retries=5):
+    """Download NASA POWER daily data for one station."""
+
     url = "https://power.larc.nasa.gov/api/temporal/daily/point"
 
     params = {
@@ -311,8 +307,8 @@ def download_nasa_power_daily(lat, lon, start_date, end_date, nasa_parameters, m
                     raise RuntimeError("Unexpected NASA POWER response format.")
 
                 data = js["properties"]["parameter"]
-                df = pd.DataFrame(data)
 
+                df = pd.DataFrame(data)
                 df.index = pd.to_datetime(df.index, format="%Y%m%d")
                 df = df.sort_index()
 
@@ -334,6 +330,8 @@ def download_nasa_power_daily(lat, lon, start_date, end_date, nasa_parameters, m
 
 
 def prepare_weather_dataframe(raw_df):
+    """Prepare NASA POWER data into clean SWAT variables."""
+
     out = pd.DataFrame(index=raw_df.index)
     out["DATE"] = out.index.strftime("%Y%m%d")
 
@@ -345,9 +343,6 @@ def prepare_weather_dataframe(raw_df):
 
     if "T2M_MIN" in raw_df.columns:
         out["TMIN_C"] = raw_df["T2M_MIN"]
-
-    if "T2M" in raw_df.columns:
-        out["TMEAN_C"] = raw_df["T2M"]
 
     if "RH2M" in raw_df.columns:
         out["RH_percent"] = raw_df["RH2M"].clip(lower=0, upper=100)
@@ -367,51 +362,90 @@ def prepare_weather_dataframe(raw_df):
     return out
 
 
-def write_index_file(folder_path, station_df):
-    index_path = os.path.join(folder_path, "INDEX.txt")
+def write_arcswat_index_file(folder_path, index_file_name, station_df):
+    """
+    Write ArcSWAT station index file:
+    ID,NAME,LAT,LONG,ELEVATION
+    """
+
+    os.makedirs(folder_path, exist_ok=True)
+
+    index_path = os.path.join(folder_path, index_file_name)
 
     index_df = station_df[["ID", "NAME", "LAT", "LONG", "ELEVATION"]].copy()
+
     index_df.to_csv(index_path, index=False)
 
     return index_path
 
 
-def write_parameter_station_file(
-    out_dir,
-    parameter_key,
-    station_name,
-    weather_df,
-    include_header=True,
-    delimiter=","
-):
-    info = NASA_PARAMETER_INFO[parameter_key]
-    folder_path = os.path.join(out_dir, info["folder"])
+def write_arcswat_station_file(folder_path, station_name, start_date_str, values_lines):
+    """
+    Write ArcSWAT station file:
+    First line  = YYYYMMDD
+    Other lines = daily values only
+    """
+
     os.makedirs(folder_path, exist_ok=True)
 
-    selected_cols = info["columns"]
-    out_cols = info["out_columns"]
+    file_path = os.path.join(folder_path, f"{safe_filename(station_name)}.txt")
 
-    available_cols = [c for c in selected_cols if c in weather_df.columns]
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(str(start_date_str) + "\n")
 
-    if len(available_cols) != len(selected_cols):
-        return None
+        for line in values_lines:
+            f.write(str(line) + "\n")
 
-    df_out = weather_df[selected_cols].copy()
-    df_out.columns = out_cols
+    return file_path
 
-    output_path = os.path.join(folder_path, f"{safe_filename(station_name)}.txt")
 
-    df_out.to_csv(
-        output_path,
-        index=False,
-        header=include_header,
-        sep=delimiter
+def write_parameter_files_arcswat(output_dir, parameter_key, station_name, weather_df):
+    """
+    Write ArcSWAT station files for selected parameter.
+    """
+
+    info = PARAMETER_INFO[parameter_key]
+    folder_path = os.path.join(output_dir, info["folder"])
+
+    start_date_str = str(weather_df["DATE"].iloc[0])
+
+    if parameter_key == "pcp":
+        values = weather_df["PCP_mm"].map(lambda x: f"{x:.3f}").tolist()
+
+    elif parameter_key == "tmp":
+        values = weather_df.apply(
+            lambda row: f"{row['TMAX_C']:.3f},{row['TMIN_C']:.3f}",
+            axis=1
+        ).tolist()
+
+    elif parameter_key == "solar":
+        values = weather_df["SOLAR_MJ_m2_day"].map(lambda x: f"{x:.3f}").tolist()
+
+    elif parameter_key == "rh":
+        values = weather_df["RH_percent"].map(lambda x: f"{x:.3f}").tolist()
+
+    elif parameter_key == "wind":
+        values = weather_df["WIND_m_s"].map(lambda x: f"{x:.3f}").tolist()
+
+    else:
+        raise ValueError(f"Unsupported parameter: {parameter_key}")
+
+    file_path = write_arcswat_station_file(
+        folder_path=folder_path,
+        station_name=station_name,
+        start_date_str=start_date_str,
+        values_lines=values
     )
 
-    return output_path
+    return file_path
 
 
 def create_zip_from_folder(folder_path, zip_path):
+    """Create ZIP from output folder."""
+
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(folder_path):
             for file in files:
@@ -422,12 +456,13 @@ def create_zip_from_folder(folder_path, zip_path):
     return zip_path
 
 
-def make_parameter_label_map():
-    return {v["label"]: k for k, v in NASA_PARAMETER_INFO.items()}
+def parameter_label_map():
+    """Create label-to-key map."""
+    return {v["label"]: k for k, v in PARAMETER_INFO.items()}
 
 
 # ============================================================
-# 7. SIDEBAR INPUTS
+# SIDEBAR
 # ============================================================
 
 with st.sidebar:
@@ -442,7 +477,7 @@ with st.sidebar:
     dem_file = st.file_uploader(
         "Upload DEM GeoTIFF",
         type=["tif", "tiff"],
-        help="DEM is used to extract elevation for each subbasin centroid."
+        help="DEM is used to extract elevation at each subbasin centroid."
     )
 
     st.divider()
@@ -463,40 +498,25 @@ with st.sidebar:
 
     st.divider()
 
-    parameter_label_map = make_parameter_label_map()
+    labels = parameter_label_map()
 
     default_labels = [
         "Precipitation",
         "Temperature Tmax and Tmin",
+        "Solar Radiation",
         "Relative Humidity",
-        "Wind Speed",
-        "Solar Radiation"
+        "Wind Speed"
     ]
 
     selected_labels = st.multiselect(
-        "Select weather parameters",
-        options=list(parameter_label_map.keys()),
+        "Select ArcSWAT weather parameters",
+        options=list(labels.keys()),
         default=default_labels
     )
 
-    selected_parameters = [parameter_label_map[label] for label in selected_labels]
+    selected_parameters = [labels[x] for x in selected_labels]
 
     st.divider()
-
-    include_header = st.checkbox("Include header in station text files", value=True)
-
-    delimiter_option = st.selectbox(
-        "Output delimiter",
-        options=["Comma (,)", "Tab", "Space"],
-        index=0
-    )
-
-    if delimiter_option == "Comma (,)":
-        delimiter = ","
-    elif delimiter_option == "Tab":
-        delimiter = "\t"
-    else:
-        delimiter = " "
 
     request_delay = st.number_input(
         "NASA request delay in seconds",
@@ -506,33 +526,55 @@ with st.sidebar:
         step=0.25
     )
 
-    st.info("For many subbasins and long date ranges, downloading may take time because NASA POWER is queried point-by-point.")
+    save_check_csv = st.checkbox(
+        "Also save combined daily CSV for checking",
+        value=True
+    )
+
+    st.info(
+        "ArcSWAT format will be generated automatically. "
+        "Station files will not contain DATE,VALUE headers."
+    )
 
 
 # ============================================================
-# 8. MAIN LAYOUT
+# MAIN INFO
 # ============================================================
 
-col1, col2, col3 = st.columns(3)
+st.markdown(
+    """
+    <div class="info-box">
+    <b>ArcSWAT Output Format</b><br>
+    For each weather parameter, this app creates one station index file such as 
+    <code>pcp.txt</code>, <code>tmp.txt</code>, <code>solar.txt</code>, 
+    <code>rh.txt</code>, and <code>wind.txt</code>. 
+    Each station file starts with <code>YYYYMMDD</code> followed by daily values only.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-with col1:
-    st.markdown('<div class="metric-card">📁 <b>Input 1</b><br>Subbasin Shapefile ZIP</div>', unsafe_allow_html=True)
+c1, c2, c3, c4 = st.columns(4)
 
-with col2:
-    st.markdown('<div class="metric-card">🗻 <b>Input 2</b><br>DEM GeoTIFF</div>', unsafe_allow_html=True)
+with c1:
+    st.metric("Weather Source", "NASA POWER")
 
-with col3:
-    st.markdown('<div class="metric-card">🌐 <b>Source</b><br>NASA POWER Daily API</div>', unsafe_allow_html=True)
+with c2:
+    st.metric("Output Format", "ArcSWAT")
 
-st.markdown("---")
+with c3:
+    st.metric("Station Method", "Subbasin Centroid")
+
+with c4:
+    st.metric("Elevation Source", "DEM")
 
 
 # ============================================================
-# 9. VALIDATION
+# VALIDATION
 # ============================================================
 
 if subbasin_zip is None or dem_file is None:
-    st.warning("Please upload both the subbasin shapefile ZIP and DEM GeoTIFF from the sidebar.")
+    st.warning("Please upload both subbasin shapefile ZIP and DEM GeoTIFF.")
     st.stop()
 
 if len(selected_parameters) == 0:
@@ -545,7 +587,7 @@ if start_date > end_date:
 
 
 # ============================================================
-# 10. TEMPORARY WORKSPACE
+# WORKSPACE
 # ============================================================
 
 if "workspace" not in st.session_state:
@@ -554,16 +596,16 @@ if "workspace" not in st.session_state:
 workspace = st.session_state.workspace
 
 input_dir = os.path.join(workspace, "inputs")
-output_dir = os.path.join(workspace, "NASA_POWER_SWAT_Output")
 extract_dir = os.path.join(workspace, "subbasin_extract")
+output_dir = os.path.join(workspace, "ArcSWAT_NASA_POWER_Output")
 
 os.makedirs(input_dir, exist_ok=True)
-os.makedirs(output_dir, exist_ok=True)
 os.makedirs(extract_dir, exist_ok=True)
+os.makedirs(output_dir, exist_ok=True)
 
 
 # ============================================================
-# 11. SAVE UPLOADED FILES
+# SAVE UPLOADED FILES
 # ============================================================
 
 sub_zip_path = os.path.join(input_dir, subbasin_zip.name)
@@ -574,7 +616,7 @@ save_uploaded_file(dem_file, dem_path)
 
 
 # ============================================================
-# 12. READ SHAPEFILE FIRST TO ALLOW NAME FIELD SELECTION
+# READ SHAPEFILE FOR FIELD SELECTION
 # ============================================================
 
 try:
@@ -587,7 +629,7 @@ try:
     ]
 
     name_field = st.selectbox(
-        "Select field for station/subbasin file names",
+        "Select field for station names / file names",
         options=available_fields,
         index=0
     )
@@ -598,7 +640,7 @@ except Exception as e:
 
 
 # ============================================================
-# 13. BUILD STATION TABLE
+# BUILD STATION TABLE
 # ============================================================
 
 try:
@@ -609,28 +651,28 @@ try:
     )
 
 except Exception as e:
-    st.error(f"Error while generating station table: {e}")
+    st.error(f"Error while creating stations: {e}")
     st.stop()
 
 
 # ============================================================
-# 14. DISPLAY STATION INFORMATION
+# DISPLAY STATION TABLE AND MAP
 # ============================================================
 
-st.subheader("📍 Generated Subbasin Weather Stations")
+st.subheader("📍 Subbasin Weather Stations")
 
-c1, c2, c3, c4 = st.columns(4)
+m1, m2, m3, m4 = st.columns(4)
 
-with c1:
+with m1:
     st.metric("Number of stations", len(station_df))
 
-with c2:
+with m2:
     st.metric("Selected parameters", len(selected_parameters))
 
-with c3:
+with m3:
     st.metric("Start year", start_date.year)
 
-with c4:
+with m4:
     st.metric("End year", end_date.year)
 
 st.write(f"**Subbasin CRS:** `{original_crs}`")
@@ -642,39 +684,38 @@ st.map(map_df[["lat", "lon"]])
 
 
 # ============================================================
-# 15. RUN DOWNLOAD
+# START PROCESSING
 # ============================================================
 
-st.subheader("🚀 Download and Generate SWAT Weather Files")
+st.subheader("🚀 Generate ArcSWAT Weather Files")
 
-run_button = st.button("Start NASA POWER Download", type="primary")
+run_button = st.button("Start NASA POWER Download and Create ArcSWAT Files", type="primary")
 
 if run_button:
 
-    # Clear old output
-    if os.path.exists(output_dir):
-        for root, dirs, files in os.walk(output_dir, topdown=False):
-            for f in files:
-                os.remove(os.path.join(root, f))
-            for d in dirs:
-                os.rmdir(os.path.join(root, d))
+    clean_folder(output_dir)
 
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Create parameter folders and INDEX files
+    # Create parameter folders and ArcSWAT station index files
     for p in selected_parameters:
-        folder = NASA_PARAMETER_INFO[p]["folder"]
-        folder_path = os.path.join(output_dir, folder)
+        info = PARAMETER_INFO[p]
+        folder_path = os.path.join(output_dir, info["folder"])
         os.makedirs(folder_path, exist_ok=True)
-        write_index_file(folder_path, station_df)
+
+        write_arcswat_index_file(
+            folder_path=folder_path,
+            index_file_name=info["index_file"],
+            station_df=station_df
+        )
 
     # Save station summary
     station_summary_path = os.path.join(output_dir, "station_summary.csv")
     station_df.to_csv(station_summary_path, index=False)
 
-    # Combined daily folder
-    combined_dir = os.path.join(output_dir, "combined_daily_csv")
-    os.makedirs(combined_dir, exist_ok=True)
+    # Optional CSV checking folder
+    check_csv_dir = os.path.join(output_dir, "daily_csv_for_checking")
+
+    if save_check_csv:
+        os.makedirs(check_csv_dir, exist_ok=True)
 
     required_nasa_parameters = get_required_nasa_parameters(selected_parameters)
 
@@ -684,7 +725,7 @@ if run_button:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    all_logs = []
+    logs = []
     preview_store = {}
 
     for idx, row in station_df.iterrows():
@@ -696,8 +737,8 @@ if run_button:
         elev = float(row["ELEVATION"])
 
         status_text.info(
-            f"Downloading station {idx + 1}/{len(station_df)}: {station_name} "
-            f"({lat:.5f}, {lon:.5f})"
+            f"Downloading station {idx + 1}/{len(station_df)}: "
+            f"{station_name} ({lat:.5f}, {lon:.5f})"
         )
 
         try:
@@ -711,23 +752,24 @@ if run_button:
 
             weather_df = prepare_weather_dataframe(raw_df)
 
-            combined_csv = os.path.join(
-                combined_dir,
-                f"{safe_filename(station_name)}_NASA_POWER_daily.csv"
-            )
-            weather_df.to_csv(combined_csv, index=False)
+            # Save CSV for checking
+            if save_check_csv:
+                check_csv_path = os.path.join(
+                    check_csv_dir,
+                    f"{safe_filename(station_name)}_NASA_POWER_daily.csv"
+                )
+                weather_df.to_csv(check_csv_path, index=False)
 
+            # Write ArcSWAT files
             for p in selected_parameters:
-                write_parameter_station_file(
-                    out_dir=output_dir,
+                write_parameter_files_arcswat(
+                    output_dir=output_dir,
                     parameter_key=p,
                     station_name=station_name,
-                    weather_df=weather_df,
-                    include_header=include_header,
-                    delimiter=delimiter
+                    weather_df=weather_df
                 )
 
-            all_logs.append({
+            logs.append({
                 "ID": station_id,
                 "NAME": station_name,
                 "LAT": lat,
@@ -743,7 +785,7 @@ if run_button:
                 preview_store[station_name] = weather_df.copy()
 
         except Exception as e:
-            all_logs.append({
+            logs.append({
                 "ID": station_id,
                 "NAME": station_name,
                 "LAT": lat,
@@ -756,26 +798,52 @@ if run_button:
             })
 
         progress_bar.progress((idx + 1) / len(station_df))
+
         time.sleep(request_delay)
 
-    log_df = pd.DataFrame(all_logs)
+    log_df = pd.DataFrame(logs)
     log_path = os.path.join(output_dir, "download_log.csv")
     log_df.to_csv(log_path, index=False)
 
-    zip_path = os.path.join(workspace, "NASA_POWER_SWAT_Weather_Output.zip")
+    # Create README
+    readme_path = os.path.join(output_dir, "README_ArcSWAT_Format.txt")
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write("NASA POWER Weather Data Prepared for ArcSWAT / SWAT2012\n")
+        f.write("=====================================================\n\n")
+        f.write("Folder contents:\n")
+        f.write("pcp/pcp.txt     = precipitation station index file\n")
+        f.write("tmp/tmp.txt     = temperature station index file\n")
+        f.write("solar/solar.txt = solar radiation station index file\n")
+        f.write("rh/rh.txt       = relative humidity station index file\n")
+        f.write("wind/wind.txt   = wind speed station index file\n\n")
+        f.write("Station files:\n")
+        f.write("First line is start date in YYYYMMDD format.\n")
+        f.write("Remaining lines contain daily values only.\n\n")
+        f.write("Temperature file format:\n")
+        f.write("First line: YYYYMMDD\n")
+        f.write("Daily lines: TMAX,TMIN\n\n")
+        f.write("Units:\n")
+        f.write("Precipitation = mm/day\n")
+        f.write("Temperature = degree Celsius\n")
+        f.write("Solar radiation = MJ/m2/day\n")
+        f.write("Relative humidity = percent\n")
+        f.write("Wind speed = m/s\n")
+
+    zip_path = os.path.join(workspace, "ArcSWAT_NASA_POWER_Weather_Output.zip")
     create_zip_from_folder(output_dir, zip_path)
 
-    st.session_state["output_dir"] = output_dir
     st.session_state["zip_path"] = zip_path
+    st.session_state["output_dir"] = output_dir
     st.session_state["log_df"] = log_df
     st.session_state["preview_store"] = preview_store
     st.session_state["selected_parameters"] = selected_parameters
 
-    status_text.success("Processing completed successfully.")
+    status_text.success("ArcSWAT weather files created successfully.")
 
 
 # ============================================================
-# 16. OUTPUT VISUALIZATION AND DOWNLOAD
+# OUTPUT DISPLAY
 # ============================================================
 
 if "zip_path" in st.session_state and os.path.exists(st.session_state["zip_path"]):
@@ -784,23 +852,24 @@ if "zip_path" in st.session_state and os.path.exists(st.session_state["zip_path"
     st.subheader("✅ Output Summary")
 
     log_df = st.session_state["log_df"]
+
     st.dataframe(log_df, use_container_width=True)
 
     success_count = (log_df["STATUS"] == "Downloaded").sum()
     failed_count = len(log_df) - success_count
 
-    c1, c2, c3 = st.columns(3)
+    o1, o2, o3 = st.columns(3)
 
-    with c1:
+    with o1:
         st.metric("Successful stations", int(success_count))
 
-    with c2:
+    with o2:
         st.metric("Failed stations", int(failed_count))
 
-    with c3:
-        st.metric("Output folders", len(st.session_state["selected_parameters"]))
+    with o3:
+        st.metric("Output ZIP", "Ready")
 
-    st.subheader("📈 Weather Time-Series Preview")
+    st.subheader("📈 Daily Weather Preview")
 
     preview_store = st.session_state["preview_store"]
 
@@ -814,44 +883,46 @@ if "zip_path" in st.session_state and os.path.exists(st.session_state["zip_path"
         preview_df = preview_store[station_choice].copy()
         preview_df["DATE_DT"] = pd.to_datetime(preview_df["DATE"], format="%Y%m%d")
 
-        value_columns = [c for c in preview_df.columns if c not in ["DATE", "DATE_DT"]]
+        value_columns = [
+            c for c in preview_df.columns
+            if c not in ["DATE", "DATE_DT"]
+        ]
 
-        selected_preview_col = st.selectbox(
-            "Select variable for chart",
+        selected_col = st.selectbox(
+            "Select variable",
             options=value_columns
         )
 
-        chart_df = preview_df[["DATE_DT", selected_preview_col]].copy()
-        chart_df = chart_df.set_index("DATE_DT")
+        chart_df = preview_df[["DATE_DT", selected_col]].set_index("DATE_DT")
 
         st.line_chart(chart_df)
 
-        st.write("Data preview")
+        st.write("First 20 rows")
         st.dataframe(preview_df.head(20), use_container_width=True)
 
-    st.subheader("📦 Download Final ZIP")
+    st.subheader("📦 Download ArcSWAT ZIP")
 
     with open(st.session_state["zip_path"], "rb") as f:
         st.download_button(
-            label="Download NASA POWER SWAT Weather ZIP",
+            label="Download ArcSWAT NASA POWER Weather ZIP",
             data=f,
-            file_name="NASA_POWER_SWAT_Weather_Output.zip",
+            file_name="ArcSWAT_NASA_POWER_Weather_Output.zip",
             mime="application/zip",
             type="primary"
         )
 
     st.info(
-        "The ZIP contains one folder for each selected weather parameter. "
-        "Each folder has an INDEX.txt file and separate station text files."
+        "Use pcp/pcp.txt, tmp/tmp.txt, solar/solar.txt, rh/rh.txt, and wind/wind.txt "
+        "inside ArcSWAT Weather Data Definition."
     )
 
 
 # ============================================================
-# 17. FOOTER
+# FOOTER
 # ============================================================
 
 st.markdown("---")
+
 st.caption(
-    "Developed for SWAT weather data preparation using NASA POWER daily point data. "
-    "Recommended workflow: verify station coordinates, check units, then import into SWAT/QSWAT/QSWAT+."
+    "Prepared for ArcSWAT / SWAT2012 weather input generation using NASA POWER daily point data."
 )
